@@ -20,14 +20,17 @@
 
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "flatbuffers/flexbuffers.h"  // from @flatbuffers
 #include "ml_drift/common/ir_model.h"  // from @ml_drift
 #include "ml_drift/common/operations.h"  // from @ml_drift
+#include "ml_drift_delegate/tflite/convert/convert_aux.h"
 #include "ml_drift_delegate/tflite/custom_ir_operation_parser.h"
 #include "ml_drift_delegate/tflite/ir_model_builder_helper.h"
 #include "ml_drift_delegate/tflite/support/support_rotary_positional_embedding.h"
 #include "tflite/c/builtin_op_data.h"
 #include "tflite/c/common.h"
+#include "tflite/kernels/kernel_util.h"
 
 namespace litert::ml_drift::ir {
 namespace {
@@ -42,6 +45,19 @@ absl::Status RopeIsSupported(const TfLiteContext* context,
   if (!IsRotaryPositionalEmbeddingSupported(context, tflite_node, registration,
                                             &error)) {
     return absl::InvalidArgumentError(error);
+  }
+  for (int i = 0; i < tflite_node->inputs->size; ++i) {
+    const int input_id = tflite_node->inputs->data[i];
+    if (input_id == kTfLiteOptionalTensor) {
+      continue;
+    }
+    const TfLiteTensor& input = context->tensors[input_id];
+    if (tflite::IsConstantTensor(&input) && input.type != kTfLiteFloat32 &&
+        input.type != kTfLiteFloat16 && input.type != kTfLiteInt32) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Unsupported constant input tensor type for odml.rope: ",
+          TfLiteTypeGetName(input.type)));
+    }
   }
   return absl::OkStatus();
 }
@@ -79,7 +95,7 @@ void ParseRopeAttributes(const uint8_t* buffer, size_t length,
 }
 
 void RopeConvert(
-    const TfLiteContext& /*context*/, const TfLiteNode& tflite_node,
+    const TfLiteContext& context, const TfLiteNode& tflite_node,
     const TfLiteRegistration& /*registration*/,
     absl::flat_hash_map<int, ::ml_drift::ir::IrTensorId>& tensor_map,
     const IrModelBuilderOptions& /*options*/,
@@ -91,8 +107,18 @@ void RopeConvert(
   op->name = "rope";
 
   for (int i = 0; i < tflite_node.inputs->size; ++i) {
-    if (tflite_node.inputs->data[i] != kTfLiteOptionalTensor) {
-      ir_model.AddConsumer(tensor_map[tflite_node.inputs->data[i]], op->id);
+    const int input_id = tflite_node.inputs->data[i];
+    if (input_id == kTfLiteOptionalTensor) {
+      continue;
+    }
+    const auto ir_tensor_id = tensor_map[input_id];
+    if (tflite::IsConstantTensor(context.tensors + input_id) &&
+        !ir_model.tensor(ir_tensor_id)->buffer_source.is_shared) {
+      ::ml_drift::ir::IrTensor* const_tensor =
+          AddConstInput(context, input_id, ir_model, {});
+      ir_model.AddConsumer(const_tensor->id, op->id);
+    } else {
+      ir_model.AddConsumer(ir_tensor_id, op->id);
     }
   }
   for (int i = 0; i < tflite_node.outputs->size; ++i) {
