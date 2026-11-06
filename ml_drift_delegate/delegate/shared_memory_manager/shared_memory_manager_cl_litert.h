@@ -20,6 +20,7 @@
 #include <unordered_map>
 
 #include "ml_drift/cl/environment.h"  // from @ml_drift
+#include "ml_drift/common/gpu_info.h"  // from @ml_drift
 #include "ml_drift/common/gpu_model.h"  // from @ml_drift
 #include "ml_drift/common/model.h"  // from @ml_drift
 #include "ml_drift_delegate/delegate/serialization_weight_cache/serialization_weight_cache.h"
@@ -41,6 +42,18 @@ class WeightLoader;
 namespace ml_drift {
 
 namespace internal {
+
+// OpenCL device extension that allows importing an AHardwareBuffer via
+// clImportMemoryARM(CL_IMPORT_TYPE_ANDROID_HARDWARE_BUFFER_ARM).
+inline constexpr char kAhwbImportExtension[] =
+    "cl_arm_import_memory_android_hardware_buffer";
+
+// Returns true if the OpenCL device advertises support for importing
+// AHardwareBuffers (kAhwbImportExtension). The AHWB weight allocation path is
+// only attempted on such devices.
+// Exposed under the internal namespace for testing.
+bool DeviceSupportsAhwbImport(const GpuInfo& gpu_info);
+
 #ifdef __ANDROID__
 // Tries to allocate a cl::Tensor backed by an AHardwareBuffer via the
 // cl_arm_import_memory extension.
