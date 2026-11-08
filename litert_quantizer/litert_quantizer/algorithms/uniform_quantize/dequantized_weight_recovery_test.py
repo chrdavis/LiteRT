@@ -61,6 +61,14 @@ def _construct_blockwise_dequantized_weights(
   return dequant_expanded.reshape(quantized_weights.shape)
 
 
+def _round_to_bfloat16(values: np.ndarray) -> np.ndarray:
+  """Rounds values to bfloat16 precision, keeping the float32 dtype."""
+  bits = np.asarray(values, dtype=np.float32).view(np.uint32)
+  # Round to nearest even, then drop the 16 mantissa bits bfloat16 lacks.
+  rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+  return rounded.view(np.float32)
+
+
 class DequantizedWeightRecoveryTest(parameterized.TestCase):
 
   def setUp(self):
@@ -193,6 +201,150 @@ class DequantizedWeightRecoveryTest(parameterized.TestCase):
       self.assertSequenceAlmostEqual(recovered_scale.flatten(), scale.flatten())
     with self.subTest(name="zp_is_zero"):
       self.assertEqual(np.sum(zp), 0)
+
+  def test_channelwise_recovery_survives_bfloat16_rounded_weights(self):
+    """Recovers scales that bfloat16 cannot represent exactly.
+
+    QAT stores `q * scale` in bfloat16 while the scale itself stays fp32. When
+    the scale needs more mantissa bits than bfloat16 has, every level rounds
+    independently and the gaps between adjacent levels stop being equal.
+    Estimating the scale from the smallest gap then always underestimates it.
+    """
+    # A full set of 4-bit levels, so each channel pins down its own scale.
+    codes = np.tile(np.arange(-8, 8, dtype=np.float32), (4, 1))
+    scales = np.array(
+        [0.0083849, 0.0187500, 0.0412350, 0.0061095], dtype=np.float32
+    )
+    dequant_vals = _round_to_bfloat16(codes * scales[:, np.newaxis])
+
+    _, recovered = (
+        dequantized_weight_recovery.get_zp_scale_from_dequantized_symmetric_weights(
+            dequant_vals, quantized_dimension=0, num_bits=4
+        )
+    )
+    recovered = recovered.flatten()
+
+    with self.subTest(name="premise_scales_are_not_bfloat16_representable"):
+      # Otherwise the levels stay evenly spaced and the test proves nothing.
+      self.assertFalse(np.any(_round_to_bfloat16(scales) == scales))
+
+    with self.subTest(name="premise_smallest_gap_is_misleading"):
+      levels = np.sort(np.abs(dequant_vals), axis=1)
+      gaps = np.diff(levels, axis=1)
+      smallest_gap = np.where(gaps > 0, gaps, np.inf).min(axis=1)
+      self.assertGreater(np.abs(smallest_gap / scales - 1).max(), 0.01)
+
+    with self.subTest(name="scale_value_match"):
+      # Seeding from the gaps alone lands at 6.4e-3 here; the least-squares
+      # refit averages the rounding noise away and lands at 1.2e-3.
+      self.assertLess(np.abs(recovered / scales - 1).max(), 2.5e-3)
+
+    with self.subTest(name="weights_are_reconstructed"):
+      per_channel_scale = recovered[:, np.newaxis]
+      requantized = np.rint(dequant_vals / per_channel_scale)
+      err = np.abs(requantized * per_channel_scale - dequant_vals)
+      # Every weight lands within 5% of a quantization step of its level.
+      self.assertLess((err.max(axis=1) / recovered).max(), 0.05)
+
+  def test_channelwise_recovery_repairs_sparse_lattice_group(self):
+    """Recovers a group whose gaps are all multiples of the step.
+
+    With levels {0, 2s, 7s} both the smallest gap (2s) and the median gap
+    (3.5s) overestimate the step, so neither the gap seed nor the
+    least-squares refit around it reconstructs the group losslessly.
+    """
+    step = np.float32(0.01303)
+    dense = np.arange(-8, 8, dtype=np.float32) * np.float32(0.02)
+    sparse = np.zeros(16, dtype=np.float32)
+    sparse[3] = 2 * step
+    sparse[11] = -7 * step
+    dequant_vals = np.stack([dense, sparse])
+
+    _, recovered = (
+        dequantized_weight_recovery.get_zp_scale_from_dequantized_symmetric_weights(
+            dequant_vals, quantized_dimension=0, num_bits=4
+        )
+    )
+    recovered = recovered.flatten()
+
+    with self.subTest(name="dense_group_scale_match"):
+      self.assertAlmostEqual(float(recovered[0]), 0.02, delta=1e-7)
+
+    with self.subTest(name="sparse_group_scale_match"):
+      self.assertAlmostEqual(float(recovered[1]), float(step), delta=1e-7)
+
+    with self.subTest(name="weights_are_reconstructed"):
+      per_channel_scale = recovered[:, np.newaxis]
+      requantized = np.clip(np.rint(dequant_vals / per_channel_scale), -8, 7)
+      np.testing.assert_allclose(
+          requantized * per_channel_scale, dequant_vals, rtol=0, atol=1e-6
+      )
+
+  def test_get_tensor_quant_params_blockwise_sparse_lattice_block(self):
+    """A sparse block passes the lossless validation (Gemma 4 26B regression).
+
+    Mirrors the block of a Gemma 4 26B-A4B down_proj weight that made the
+    recovery fail: 30 zeros, 2s and 7s in one block of 32.
+    """
+    block_size = 32
+    step = np.float32(0.01303)
+    dense = np.array([1, -2, 3, -4] * 8, dtype=np.float32) * np.float32(0.1)
+    sparse = np.zeros(block_size, dtype=np.float32)
+    sparse[12] = 2 * step
+    sparse[17] = 7 * step
+    dequant_vals = np.vstack([dense, sparse])
+
+    tensor_quant_config = qtyping.TensorQuantizationConfig(
+        num_bits=4,
+        granularity=qtyping.QuantGranularity.BLOCKWISE_32,
+    )
+    tensor_quant_params = dequantized_weight_recovery.get_tensor_quant_params(
+        self._dummy_op_info, tensor_quant_config, dequant_vals
+    )
+
+    with self.subTest(name="scale_match"):
+      np.testing.assert_allclose(
+          tensor_quant_params.scale.flatten(),
+          np.array([0.1, step], dtype=np.float32),
+          rtol=1e-6,
+      )
+
+    with self.subTest(name="codes_match"):
+      codes = np.asarray(tensor_quant_params.quantized_data)
+      self.assertEqual(codes[1, 12], 2)
+      self.assertEqual(codes[1, 17], 7)
+      self.assertEqual(np.count_nonzero(codes[1]), 2)
+
+  def test_compute_scale_from_diffs_picks_min_or_median_gap(self):
+    """Picks the median gap on dense rows and the minimum gap on sparse rows.
+
+    Calls the helper directly because the least-squares refit that follows it
+    in `get_zp_scale_from_dequantized_symmetric_weights` would hide these edge
+    cases.
+    """
+    diffs = np.array(
+        [
+            # Dense with rounding noise: median 0.01 <= 1.35 * min 0.0099.
+            [0.0, 0.0099, 0.01, 0.0101],
+            # Sparse: median 0.05 > 1.35 * min 0.01, so the minimum wins.
+            [0.0, 0.01, 0.05, 0.05],
+            # Even count: the median averages the two middle gaps.
+            [0.02, 0.02, 0.03, 0.03],
+            # A single positive gap.
+            [0.0, 0.0, 0.02, 0.0],
+            # No positive gap falls back to `min_scale`.
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    scales = dequantized_weight_recovery._compute_scale_from_diffs(  # pylint: disable=protected-access
+        diffs, min_scale=1e-9
+    )
+
+    np.testing.assert_allclose(
+        scales, [0.01, 0.01, 0.025, 0.02, 1e-9], rtol=1e-6
+    )
 
   @parameterized.named_parameters(
       dict(testcase_name="negative_dimension", quantized_dimension=-1),
