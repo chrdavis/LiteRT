@@ -130,6 +130,13 @@ struct BlockwiseQuantization : Quantization {
   std::vector<int64_t> zero_points;
   int block_size;
   int quantized_dimension;
+  // When `scales_tensor_name` is set, the TFLite serializer writes no scale
+  // tensor of its own: the details reference the existing tensor of that name
+  // in the same subgraph (e.g. the float32 scale input of a "moe" custom op),
+  // and `block_shape` (one entry per dimension) is written when not empty.
+  // This is LiteRT Quantizer's multi-axis form for MoE experts.
+  std::vector<int32_t> block_shape;
+  std::string scales_tensor_name;
 };
 
 using Shape = std::vector<int32_t>;
