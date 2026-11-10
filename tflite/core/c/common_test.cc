@@ -135,6 +135,18 @@ TEST(Types, TestTypeNames) {
   EXPECT_EQ(type_name(kTfLiteInt4), "INT4");
 }
 
+TEST(Types, TestQuantizationTypeNames) {
+  auto type_name = [](TfLiteQuantizationType t) {
+    return std::string(TfLiteQuantizationTypeGetName(t));
+  };
+  EXPECT_EQ(type_name(kTfLiteNoQuantization), "None");
+  EXPECT_EQ(type_name(kTfLiteAffineQuantization), "Affine");
+  EXPECT_EQ(type_name(kTfLiteBlockwiseQuantization), "Blockwise");
+  EXPECT_EQ(type_name(kTfLiteMultiAxisQuantization), "MultiAxis");
+  EXPECT_EQ(type_name(kTfLiteBlockwiseQuantizationV2), "BlockwiseV2");
+  EXPECT_EQ(type_name(static_cast<TfLiteQuantizationType>(-1)), "Unknown");
+}
+
 TEST(Quantization, TestQuantizationFree) {
   TfLiteTensor t;
   // Set these values, otherwise TfLiteTensorFree has uninitialized values.
